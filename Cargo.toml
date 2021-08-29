@@ -1,6 +1,6 @@
 [package]
 name = "eggshell"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2018"
 authors = ["Erik Hollensbe <linux@hollensbe.org>", "Adam Ierymenko <adam.ierymenko@zerotier.com>"]
 description = "Remove testing docker containers after this object goes away"
