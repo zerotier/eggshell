@@ -6,7 +6,6 @@ authors = ["Erik Hollensbe <linux@hollensbe.org>", "Adam Ierymenko <adam.ierymen
 description = "Remove testing docker containers after this object goes away"
 homepage = "https://github.com/zerotier/eggshell"
 repository = "https://github.com/zerotier/eggshell"
-documentation = "https://github.com/zerotier/eggshell/blob/main/README.md"
 license = "BSD-3-Clause"
 readme = "README.md"
 keywords = ["docker", "testing", "containers", "zerotier"]
