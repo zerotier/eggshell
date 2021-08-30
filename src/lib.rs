@@ -8,15 +8,19 @@
 //! EggShell requires a multi-threaded tokio async runtime to function. Please create one in your
 //! environment that tokio can "find" with the tokio::runtime::Handle::current() call.
 //!
+//! If you want to handle signals in your tests, call supervise_signals().
+//!
 
-use std::sync::Arc;
-use tokio::{runtime::Handle, sync::Mutex};
+use core::panic;
+use std::{future::Future, sync::Arc};
 
 use bollard::{
     container::{CreateContainerOptions, RemoveContainerOptions, StartContainerOptions},
     Docker,
 };
+use lazy_static::lazy_static;
 use thiserror::Error;
+use tokio::{runtime::Handle, signal::unix::SignalKind, sync::Mutex};
 
 /// EggShell is basically a container for containers. When provided a docker client, it funnels
 /// all container create operations through it, allowing it to track what needs to be cleaned up.
@@ -24,7 +28,7 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct EggShell {
     docker: Arc<Mutex<Docker>>,
-    containers: Vec<String>,
+    containers: Arc<Mutex<Vec<String>>>,
     debug: bool,
 }
 
@@ -50,6 +54,73 @@ pub enum DockerError {
     DeleteContainer(String),
 }
 
+lazy_static! {
+    static ref EGGSHELLS: Arc<Mutex<Vec<EggShell>>> = Arc::new(Mutex::new(Vec::new()));
+    static ref SUPERVISOR_RUNNING: Arc<Mutex<Option<()>>> = Arc::new(Mutex::new(None));
+}
+
+/// Please call this function in your tests with tokio::spawn() to handle signals being sent to
+/// your tests. A wait function can be supplied to perform any final settling before terminating
+/// the test program.
+///
+/// ```
+/// use eggshell::supervise_signals;
+/// use std::time::Duration;
+/// use tokio::{runtime::Handle, time::sleep};
+///
+/// fn signal_handler() {
+///     let handle = Handle::current();
+///     handle.spawn(supervise_signals(async { sleep(Duration::new(1, 0)).await; }));
+/// }
+/// ```
+pub async fn supervise_signals<F>(wait_hook: F)
+where
+    F: Future<Output = ()>,
+{
+    let mut supervisor = SUPERVISOR_RUNNING.lock().await;
+
+    if !supervisor.is_some() {
+        supervisor.replace(());
+        drop(supervisor)
+    } else {
+        return;
+    }
+
+    let mut interrupt = tokio::signal::unix::signal(SignalKind::interrupt()).unwrap();
+    let mut terminate = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
+
+    tokio::select! {
+    _ = interrupt.recv() => {},
+    _ = terminate.recv() => {},
+    };
+
+    eprintln!("eggshell: signal received, tearing down containers");
+
+    let mut lock = EGGSHELLS.lock().await.clone();
+
+    let mut i = 0;
+    let mut prune_indexes = Vec::new();
+
+    for shell in lock.iter_mut() {
+        if let Err(e) = shell.teardown().await {
+            eprintln!("error during teardown: {:?}", e);
+        } else {
+            prune_indexes.push(i)
+        }
+        i += 1;
+    }
+
+    for idx in prune_indexes {
+        lock.remove(idx);
+    }
+
+    wait_hook.await;
+
+    if lock.len() == 0 {
+        std::process::abort()
+    }
+}
+
 impl EggShell {
     /// Construct a new EggShell. When dropped or when teardown() is called, all containers
     /// launched through it will be reaped.
@@ -59,11 +130,14 @@ impl EggShell {
             Err(_) => return Err(Error::Docker(DockerError::Ping)),
         }
 
-        Ok(Self {
+        let this = Self {
             docker,
-            containers: Vec::new(),
+            containers: Arc::new(Mutex::new(Vec::new())),
             debug: false,
-        })
+        };
+
+        EGGSHELLS.lock().await.push(this.clone());
+        Ok(this)
     }
 
     /// set_debug turns off the teardown functionality for this EggShell, allowing you to debug
@@ -83,6 +157,8 @@ impl EggShell {
         container: bollard::container::Config<String>,
         start_options: Option<StartContainerOptions<String>>,
     ) -> Result<(), Error> {
+        self.containers.lock().await.push(name.to_string());
+
         match self
             .docker
             .lock()
@@ -109,20 +185,25 @@ impl EggShell {
             Err(_) => return Err(Error::Docker(DockerError::StartContainer(name.to_string()))),
         };
 
-        self.containers.push(name.to_string());
         Ok(())
     }
 
     /// teardown is what reaps the launch()'d containers. It is called as a part of drop() as well.
     pub async fn teardown(&self) -> Result<(), Error> {
         if !self.debug {
-            for container in &self.containers {
+            let mut error = None;
+            let mut containers = self.containers.lock().await;
+
+            while containers.len() > 0 {
+                let len = containers.len();
+                let container = &containers[len - 1];
+
                 match self
                     .docker
                     .lock()
                     .await
                     .remove_container(
-                        &container,
+                        container,
                         Some(RemoveContainerOptions {
                             force: true,
                             ..Default::default()
@@ -132,9 +213,19 @@ impl EggShell {
                 {
                     Ok(_) => {}
                     Err(e) => {
-                        return Err(Error::Docker(DockerError::DeleteContainer(e.to_string())))
+                        if EGGSHELLS.lock().await.len() > 1 {
+                            error.replace(Err(Error::Docker(DockerError::DeleteContainer(
+                                e.to_string(),
+                            ))));
+                        }
                     }
                 }
+
+                containers.remove(len - 1);
+            }
+
+            if error.is_some() {
+                return error.unwrap();
             }
         }
 
@@ -150,13 +241,32 @@ impl Drop for EggShell {
 }
 
 mod tests {
+
     #[tokio::test(flavor = "multi_thread")]
     async fn basic() {
-        use super::EggShell;
+        use crate::supervise_signals;
+        use crate::EggShell;
         use bollard::container::Config;
         use bollard::Docker;
         use std::sync::Arc;
+        use std::time::Duration;
         use tokio::sync::Mutex;
+        use tokio::time::sleep;
+
+        // you should be able to ^C this test fine without a process hanging past the time all the
+        // docker containers are cleaned up.
+        tokio::spawn(supervise_signals(async {
+            sleep(Duration::new(1, 0)).await
+        }));
+        tokio::spawn(supervise_signals(async { () }));
+        tokio::spawn(supervise_signals(async { () }));
+        tokio::spawn(supervise_signals(async { () }));
+        tokio::spawn(supervise_signals(async { () }));
+        tokio::spawn(supervise_signals(async { () }));
+        tokio::spawn(supervise_signals(async { () }));
+        tokio::spawn(supervise_signals(async { () }));
+
+        let units = 20;
 
         let docker = Arc::new(Mutex::new(Docker::connect_with_unix_defaults().unwrap()));
 
@@ -173,7 +283,7 @@ mod tests {
 
         let mut gs = res.unwrap();
 
-        for num in 0..10 {
+        for num in 0..units {
             let res = gs
                 .launch(
                     &format!("test-{}", num),
@@ -197,7 +307,7 @@ mod tests {
             .unwrap()
             .len();
 
-        assert!(newcount == count + 10);
+        assert!(newcount == count + units);
 
         drop(gs);
 
