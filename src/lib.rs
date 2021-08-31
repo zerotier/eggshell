@@ -63,6 +63,9 @@ lazy_static! {
 /// your tests. A wait function can be supplied to perform any final settling before terminating
 /// the test program.
 ///
+/// In the event multiple signal handlers are spawned, N+1 handlers will simply run the wait hook
+/// and return. Only the first execution is responsible for reaping all eggshells.
+///
 /// ```
 /// use eggshell::supervise_signals;
 /// use std::time::Duration;
@@ -83,6 +86,7 @@ where
         supervisor.replace(());
         drop(supervisor)
     } else {
+        wait_hook.await;
         return;
     }
 
