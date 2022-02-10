@@ -210,7 +210,8 @@ impl EggShell {
                         container,
                         Some(RemoveContainerOptions {
                             force: true,
-                            ..Default::default()
+                            v: true,
+                            link: false,
                         }),
                     )
                     .await
